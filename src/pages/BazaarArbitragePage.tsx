@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowDownUp, Boxes, ChevronDown, ChevronRight, RefreshCw, ShoppingCart, TrendingUp } from "lucide-react";
 import { BazaarArbitrageService, DataService } from "../services";
 import type { ArbitrageOpportunity } from "../types/bazaarArbitrage";
@@ -30,14 +30,18 @@ export const BazaarArbitragePage: React.FC = () => {
   const [inventoryStacks, setInventoryStacks] = useState(DEFAULT_STACKS);
   const [shardNames, setShardNames] = useState<Record<string, string>>({});
   const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
+  const runningRef = useRef(false);
+  const timerRef = useRef<number | null>(null);
 
   const capitalBudget = Math.max(0, capitalMillions) * 1_000_000;
   const inventoryCapacityUnits = inventoryStacks * STACK_SIZE;
-  const displayOpportunities = useMemo(() => opportunities, [opportunities]);
 
   const refresh = useCallback(async () => {
+    if (runningRef.current) return;
+    runningRef.current = true;
     setLoading(true);
     setError(null);
+
     try {
       const [results, shards] = await Promise.all([
         BazaarArbitrageService.getInstance().findOpportunities({
@@ -50,6 +54,7 @@ export const BazaarArbitragePage: React.FC = () => {
         }),
         DataService.getInstance().loadShards(),
       ]);
+
       setOpportunities(results);
       setShardNames(Object.fromEntries(shards.map((shard) => [shard.id, shard.name])));
       setLastUpdated(results[0]?.fetchedAt ?? Date.now());
@@ -58,14 +63,19 @@ export const BazaarArbitragePage: React.FC = () => {
       console.error(err);
       setError(err instanceof Error ? err.message : "Failed to load Bazaar data");
     } finally {
+      runningRef.current = false;
       setLoading(false);
+      timerRef.current = window.setTimeout(() => {
+        void refresh();
+      }, 30_000);
     }
   }, [capitalBudget, inventoryStacks]);
 
   useEffect(() => {
     void refresh();
-    const interval = window.setInterval(() => void refresh(), 30_000);
-    return () => window.clearInterval(interval);
+    return () => {
+      if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+    };
   }, [refresh]);
 
   const purchaseLines = useCallback((opportunity: ArbitrageOpportunity): PurchaseLine[] => opportunity.acquisitionPath
@@ -99,7 +109,11 @@ export const BazaarArbitragePage: React.FC = () => {
               Inputs use the live <strong>sell-offer</strong> book for true instant buys. Large purchases consume deeper sell levels; outputs use the live buy-order book for immediate sales.
             </p>
           </div>
-          <button onClick={() => void refresh()} disabled={loading} className="inline-flex items-center justify-center gap-2 rounded-md bg-slate-800 hover:bg-slate-700 disabled:opacity-50 px-4 py-2 text-sm font-medium">
+          <button
+            onClick={() => void refresh()}
+            disabled={loading}
+            className="inline-flex items-center justify-center gap-2 rounded-md bg-slate-800 hover:bg-slate-700 disabled:opacity-50 px-4 py-2 text-sm font-medium"
+          >
             <RefreshCw className={`w-4 h-4 ${loading ? "animate-spin" : ""}`} /> Refresh
           </button>
         </header>
@@ -136,6 +150,7 @@ export const BazaarArbitragePage: React.FC = () => {
           </div>
         </div>
 
+        {loading && <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-3 text-sm text-slate-400">Scanning live Bazaar depth…</div>}
         {error && <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-4 text-red-200">{error}</div>}
 
         <div className="overflow-x-auto rounded-lg border border-slate-800 bg-slate-900/60">
@@ -148,7 +163,7 @@ export const BazaarArbitragePage: React.FC = () => {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800">
-              {displayOpportunities.map((opportunity, index) => {
+              {opportunities.map((opportunity, index) => {
                 const key = `${opportunity.shardId}|${opportunity.recipe.outputQuantity}|${[...opportunity.recipe.inputs].sort().join("|")}`;
                 const expanded = expandedRows.has(key);
                 const purchases = purchaseLines(opportunity);
@@ -183,19 +198,21 @@ export const BazaarArbitragePage: React.FC = () => {
                       </td>
                     </tr>
                     {expanded && (
-                      <tr><td colSpan={9} className="px-6 py-4 bg-slate-950/70">
-                        <div className="space-y-2 text-sm">
-                          <div className="font-semibold">Execution details</div>
-                          <div className="text-slate-400">Raw-material shopping list: {opportunity.peakInventoryUnits.toLocaleString()} units ({opportunity.peakInventoryStacks.toFixed(1)} stacks) for the complete batch. Your configured simultaneous capacity is {inventoryCapacityUnits.toLocaleString()} units.</div>
-                          <div className="text-slate-400">The complete batch cost and profit are calculated from actual order-book depth. If the shopping list exceeds one inventory, execute it in cycles after selling each completed wave.</div>
-                          <div className="text-slate-400">Finished output is valued by consuming the live buy-order book for {opportunity.outputQuantity.toLocaleString()} units; the result is not based on a single quoted price.</div>
-                        </div>
-                      </td></tr>
+                      <tr>
+                        <td colSpan={9} className="px-6 py-4 bg-slate-950/70">
+                          <div className="space-y-2 text-sm">
+                            <div className="font-semibold">Execution details</div>
+                            <div className="text-slate-400">The displayed purchase list is the complete batch. The scanner itself is bounded and never performs recursive acquisition during the live pass.</div>
+                            <div className="text-slate-400">Input costs consume the actual sell-offer depth; output revenue consumes the actual buy-order depth.</div>
+                            <div className="text-slate-400">The configured inventory capacity is {inventoryCapacityUnits.toLocaleString()} shards ({inventoryStacks} stacks).</div>
+                          </div>
+                        </td>
+                      </tr>
                     )}
                   </React.Fragment>
                 );
               })}
-              {!loading && displayOpportunities.length === 0 && !error && <tr><td colSpan={9} className="px-4 py-10 text-center text-slate-500">No profitable executable batch found.</td></tr>}
+              {!loading && opportunities.length === 0 && !error && <tr><td colSpan={9} className="px-4 py-10 text-center text-slate-500">No profitable executable batch found.</td></tr>}
             </tbody>
           </table>
         </div>
