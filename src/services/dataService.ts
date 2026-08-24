@@ -62,14 +62,17 @@ export class DataService {
           orders: entry.orders,
         }));
 
-      const sellSummary = toLevels(Object.values(product.sell_summary ?? {}));
-      const buySummary = toLevels(Object.values(product.buy_summary ?? {}));
+      // Hypixel supplies summarized book entries, but we sort explicitly so execution
+      // calculations never depend on object-entry order.
+      const sellSummary = toLevels(Object.values(product.sell_summary ?? {}))
+        .filter((level) => level.amount > 0 && level.pricePerUnit >= 0)
+        .sort((a, b) => a.pricePerUnit - b.pricePerUnit);
+      const buySummary = toLevels(Object.values(product.buy_summary ?? {}))
+        .filter((level) => level.amount > 0 && level.pricePerUnit >= 0)
+        .sort((a, b) => b.pricePerUnit - a.pricePerUnit);
 
       products[productId] = {
         productId: product.productId,
-        // `sell_summary` contains sell offers: these are the orders you consume when
-        // buying instantly. `buy_summary` contains buy orders: these are the orders
-        // you consume when selling instantly.
         instantBuy: sellSummary[0] ?? null,
         instantSell: buySummary[0] ?? null,
         sellSummary,
