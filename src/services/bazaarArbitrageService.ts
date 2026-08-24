@@ -1,13 +1,18 @@
-import { CalculationService } from "./calculationService";
 import { DataService } from "./dataService";
-import type { ArbitrageLeg, ArbitrageOpportunity, ArbitrageOptions, BazaarLevel } from "../types/bazaarArbitrage";
-import type { CalculationParams, Data, Recipe, Shard } from "../types/types";
+import type {
+  ArbitrageLeg,
+  ArbitrageOpportunity,
+  ArbitrageOptions,
+  BazaarLevel,
+} from "../types/bazaarArbitrage";
+import type { Data, Recipe, Shard } from "../types/types";
 
 const DEFAULT_SALE_TAX = 0.01;
 const DEFAULT_CAPITAL_BUDGET = 100_000_000;
 const DEFAULT_INVENTORY_STACKS = 35;
 const DEFAULT_STACK_SIZE = 64;
-const MAX_CRAFT_SEARCH = 1_200;
+const MAX_CANDIDATES_PER_RECIPE = 72;
+const MAX_RECURSION = 32;
 const EPSILON = 1e-9;
 
 type QuantityMap = Map<string, number>;
@@ -35,18 +40,15 @@ export class BazaarArbitrageService {
   private static instance: BazaarArbitrageService;
 
   public static getInstance(): BazaarArbitrageService {
-    if (!BazaarArbitrageService.instance) {
-      BazaarArbitrageService.instance = new BazaarArbitrageService();
-    }
+    if (!BazaarArbitrageService.instance) BazaarArbitrageService.instance = new BazaarArbitrageService();
     return BazaarArbitrageService.instance;
   }
 
-  /** Immediate-buy cost from the live sell-offer ladder. */
+  /** Immediate-buy cost: consume cheapest live sell offers first, including depth. */
   public getInstantBuyCost(levels: BazaarLevel[], quantity: number): number {
     if (quantity <= EPSILON) return 0;
     let remaining = quantity;
     let total = 0;
-
     for (const level of levels) {
       if (remaining <= EPSILON) break;
       if (level.amount <= 0 || level.pricePerUnit < 0) continue;
@@ -54,16 +56,14 @@ export class BazaarArbitrageService {
       total += filled * level.pricePerUnit;
       remaining -= filled;
     }
-
     return remaining > EPSILON ? Infinity : total;
   }
 
-  /** Immediate-sell revenue from the live buy-order ladder. */
+  /** Immediate-sell revenue: consume highest live buy orders first, including depth. */
   public getInstantSellRevenue(levels: BazaarLevel[], quantity: number): number {
     if (quantity <= EPSILON) return 0;
     let remaining = quantity;
     let total = 0;
-
     for (const level of levels) {
       if (remaining <= EPSILON) break;
       if (level.amount <= 0 || level.pricePerUnit < 0) continue;
@@ -71,33 +71,7 @@ export class BazaarArbitrageService {
       total += filled * level.pricePerUnit;
       remaining -= filled;
     }
-
     return remaining > EPSILON ? -Infinity : total;
-  }
-
-  private makeMarketParams(prices: Record<string, number>): CalculationParams {
-    return {
-      customRates: prices,
-      hunterFortune: 0,
-      excludeChameleon: true,
-      frogBonus: false,
-      newtLevel: 0,
-      salamanderLevel: 0,
-      lizardKingLevel: 0,
-      leviathanLevel: 0,
-      pythonLevel: 0,
-      kingCobraLevel: 0,
-      seaSerpentLevel: 0,
-      tiamatLevel: 0,
-      crocodileLevel: 0,
-      kuudraTier: "none",
-      moneyPerHour: null,
-      customKuudraTime: false,
-      kuudraTimeSeconds: null,
-      noWoodenBait: false,
-      rateAsCoinValue: true,
-      craftPenalty: 0,
-    };
   }
 
   private addQuantity(target: QuantityMap, shardId: string, quantity: number): void {
@@ -110,34 +84,32 @@ export class BazaarArbitrageService {
   }
 
   /**
-   * Compare direct immediate purchase vs every legal recursive fusion path at the
-   * exact requested quantity. This is depth-aware: every direct purchase walks the
-   * sell-offer ladder and therefore scales with actual order-book liquidity.
+   * Compare direct instant-buy acquisition with recursive fusion at the exact quantity.
+   * This does not use quick_status or buy-order prices for inputs. Every direct purchase
+   * walks the sell-offer ladder for the requested quantity.
    */
   private getBestAcquisition(
     shardId: string,
     quantity: number,
     data: Data,
-    snapshotProducts: Record<string, { sellSummary: BazaarLevel[] }>,
+    products: Record<string, { sellSummary: BazaarLevel[] }>,
     shardsById: Map<string, Shard>,
     memo: Map<string, AcquisitionResult>,
-    visiting: Set<string>
+    visiting: Set<string>,
+    depth: number
   ): AcquisitionResult {
     if (quantity <= EPSILON) return { cost: 0, rawMaterials: new Map() };
+    if (depth > MAX_RECURSION || visiting.has(shardId)) return { cost: Infinity, rawMaterials: new Map() };
 
     const requested = Math.ceil(quantity - EPSILON);
     const memoKey = `${shardId}:${requested}`;
     const cached = memo.get(memoKey);
     if (cached) return { cost: cached.cost, rawMaterials: new Map(cached.rawMaterials) };
 
-    if (visiting.has(shardId)) return { cost: Infinity, rawMaterials: new Map() };
-
     const shard = shardsById.get(shardId);
-    const product = shard ? snapshotProducts[shard.internal_id] : undefined;
+    const product = shard ? products[shard.internal_id] : undefined;
     let bestCost = product ? this.getInstantBuyCost(product.sellSummary, requested) : Infinity;
-    let bestMaterials: QuantityMap = Number.isFinite(bestCost)
-      ? new Map([[shardId, requested]])
-      : new Map();
+    let bestMaterials: QuantityMap = Number.isFinite(bestCost) ? new Map([[shardId, requested]]) : new Map();
 
     const nextVisiting = new Set(visiting);
     nextVisiting.add(shardId);
@@ -154,10 +126,11 @@ export class BazaarArbitrageService {
         inputA,
         shardA.fuse_amount * crafts,
         data,
-        snapshotProducts,
+        products,
         shardsById,
         memo,
-        nextVisiting
+        nextVisiting,
+        depth + 1
       );
       if (!Number.isFinite(costA.cost)) continue;
 
@@ -165,10 +138,11 @@ export class BazaarArbitrageService {
         inputB,
         shardB.fuse_amount * crafts,
         data,
-        snapshotProducts,
+        products,
         shardsById,
         memo,
-        nextVisiting
+        nextVisiting,
+        depth + 1
       );
       if (!Number.isFinite(costB.cost)) continue;
 
@@ -182,30 +156,27 @@ export class BazaarArbitrageService {
       }
     }
 
-    const result = { cost: bestCost, rawMaterials: new Map(bestMaterials) };
+    const result: AcquisitionResult = { cost: bestCost, rawMaterials: new Map(bestMaterials) };
     memo.set(memoKey, result);
     return { cost: result.cost, rawMaterials: new Map(result.rawMaterials) };
   }
 
   private buildPurchaseLegs(
     rawMaterials: QuantityMap,
-    snapshotProducts: Record<string, { sellSummary: BazaarLevel[] }>,
+    products: Record<string, { sellSummary: BazaarLevel[] }>,
     shardsById: Map<string, Shard>
   ): ArbitrageLeg[] {
     return [...rawMaterials.entries()]
       .map(([shardId, quantity]) => {
         const shard = shardsById.get(shardId);
-        const product = shard ? snapshotProducts[shard.internal_id] : undefined;
-        const levels = product?.sellSummary ?? [];
+        const levels = shard ? (products[shard.internal_id]?.sellSummary ?? []) : [];
         const totalCost = this.getInstantBuyCost(levels, quantity);
-        const unitCost = quantity > EPSILON ? totalCost / quantity : Infinity;
-        const instantBuyUnitPrice = levels[0]?.pricePerUnit ?? Infinity;
         return {
           shardId,
           quantity,
-          unitCost,
+          unitCost: quantity > EPSILON ? totalCost / quantity : Infinity,
           totalCost,
-          instantBuyUnitPrice,
+          instantBuyUnitPrice: levels[0]?.pricePerUnit ?? Infinity,
           method: "bazaar" as const,
         };
       })
@@ -224,56 +195,39 @@ export class BazaarArbitrageService {
     recipe: Recipe,
     crafts: number,
     data: Data,
-    snapshotProducts: Record<string, { sellSummary: BazaarLevel[]; buySummary: BazaarLevel[] }>,
+    products: Record<string, { sellSummary: BazaarLevel[]; buySummary: BazaarLevel[] }>,
     shardsById: Map<string, Shard>,
     saleTaxRate: number,
     capitalBudget: number,
     inventoryCapacityUnits: number,
-    acquisitionMemo: Map<string, AcquisitionResult>
+    memo: Map<string, AcquisitionResult>
   ): BatchEvaluation {
     const outputQuantity = recipe.outputQuantity * crafts;
+    const [inputA, inputB] = recipe.inputs;
+    const shardA = data.shards[inputA];
+    const shardB = data.shards[inputB];
+    if (!shardA || !shardB) return { crafts, outputQuantity, rawMaterials: new Map(), inputCost: Infinity, grossRevenue: 0, saleTax: 0, netRevenue: -Infinity, profit: -Infinity, roi: -Infinity, peakInventoryUnits: Infinity, feasible: false };
+
+    const acquisitionA = this.getBestAcquisition(inputA, shardA.fuse_amount * crafts, data, products, shardsById, memo, new Set(), 0);
+    const acquisitionB = this.getBestAcquisition(inputB, shardB.fuse_amount * crafts, data, products, shardsById, memo, new Set(), 0);
+    if (!Number.isFinite(acquisitionA.cost) || !Number.isFinite(acquisitionB.cost)) return { crafts, outputQuantity, rawMaterials: new Map(), inputCost: Infinity, grossRevenue: 0, saleTax: 0, netRevenue: -Infinity, profit: -Infinity, roi: -Infinity, peakInventoryUnits: Infinity, feasible: false };
+
     const rawMaterials: QuantityMap = new Map();
-    const inputA = data.shards[recipe.inputs[0]];
-    const inputB = data.shards[recipe.inputs[1]];
-
-    if (!inputA || !inputB) {
-      return { crafts, outputQuantity, rawMaterials, inputCost: Infinity, grossRevenue: 0, saleTax: 0, netRevenue: -Infinity, profit: -Infinity, roi: -Infinity, peakInventoryUnits: Infinity, feasible: false };
-    }
-
-    const acquisitionA = this.getBestAcquisition(recipe.inputs[0], inputA.fuse_amount * crafts, data, snapshotProducts, shardsById, acquisitionMemo, new Set());
-    const acquisitionB = this.getBestAcquisition(recipe.inputs[1], inputB.fuse_amount * crafts, data, snapshotProducts, shardsById, acquisitionMemo, new Set());
-
-    if (!Number.isFinite(acquisitionA.cost) || !Number.isFinite(acquisitionB.cost)) {
-      return { crafts, outputQuantity, rawMaterials, inputCost: Infinity, grossRevenue: 0, saleTax: 0, netRevenue: -Infinity, profit: -Infinity, roi: -Infinity, peakInventoryUnits: Infinity, feasible: false };
-    }
-
     this.mergeQuantities(rawMaterials, acquisitionA.rawMaterials);
     this.mergeQuantities(rawMaterials, acquisitionB.rawMaterials);
 
     const inputCost = acquisitionA.cost + acquisitionB.cost;
-    if (!Number.isFinite(inputCost) || inputCost > capitalBudget + EPSILON) {
-      return { crafts, outputQuantity, rawMaterials, inputCost, grossRevenue: 0, saleTax: 0, netRevenue: -inputCost, profit: -Infinity, roi: -Infinity, peakInventoryUnits: this.estimatePeakRawInventory(rawMaterials), feasible: false };
-    }
+    if (!Number.isFinite(inputCost) || inputCost > capitalBudget + EPSILON) return { crafts, outputQuantity, rawMaterials, inputCost, grossRevenue: 0, saleTax: 0, netRevenue: -inputCost, profit: -Infinity, roi: -Infinity, peakInventoryUnits: this.estimatePeakRawInventory(rawMaterials), feasible: false };
 
-    const outputProduct = snapshotProducts[shardsById.get(targetShardId)?.internal_id ?? ""];
-    if (!outputProduct) {
-      return { crafts, outputQuantity, rawMaterials, inputCost, grossRevenue: 0, saleTax: 0, netRevenue: -inputCost, profit: -Infinity, roi: -Infinity, peakInventoryUnits: this.estimatePeakRawInventory(rawMaterials), feasible: false };
-    }
+    const output = products[shardsById.get(targetShardId)?.internal_id ?? ""];
+    if (!output) return { crafts, outputQuantity, rawMaterials, inputCost, grossRevenue: 0, saleTax: 0, netRevenue: -inputCost, profit: -Infinity, roi: -Infinity, peakInventoryUnits: this.estimatePeakRawInventory(rawMaterials), feasible: false };
 
-    const grossRevenue = this.getInstantSellRevenue(outputProduct.buySummary, outputQuantity);
-    if (!Number.isFinite(grossRevenue)) {
-      return { crafts, outputQuantity, rawMaterials, inputCost, grossRevenue: 0, saleTax: 0, netRevenue: -inputCost, profit: -Infinity, roi: -Infinity, peakInventoryUnits: this.estimatePeakRawInventory(rawMaterials), feasible: false };
-    }
+    const grossRevenue = this.getInstantSellRevenue(output.buySummary, outputQuantity);
+    if (!Number.isFinite(grossRevenue)) return { crafts, outputQuantity, rawMaterials, inputCost, grossRevenue: 0, saleTax: 0, netRevenue: -inputCost, profit: -Infinity, roi: -Infinity, peakInventoryUnits: this.estimatePeakRawInventory(rawMaterials), feasible: false };
 
     const saleTax = grossRevenue * saleTaxRate;
     const netRevenue = grossRevenue - saleTax;
     const profit = netRevenue - inputCost;
-    const roi = inputCost > EPSILON ? profit / inputCost : Infinity;
-    const peakInventoryUnits = this.estimatePeakRawInventory(rawMaterials);
-
-    // The full batch can be executed in waves when raw materials exceed one inventory.
-    // Inventory capacity therefore informs the displayed wave plan rather than falsely
-    // forcing the total shopping list below 35 stacks.
     return {
       crafts,
       outputQuantity,
@@ -283,10 +237,83 @@ export class BazaarArbitrageService {
       saleTax,
       netRevenue,
       profit,
-      roi,
-      peakInventoryUnits,
+      roi: inputCost > EPSILON ? profit / inputCost : Infinity,
+      peakInventoryUnits: this.estimatePeakRawInventory(rawMaterials),
       feasible: inventoryCapacityUnits > 0,
     };
+  }
+
+  /** Candidate craft counts: order-book breakpoints + inventory/capital scale points, bounded. */
+  private buildCandidateCraftCounts(
+    recipe: Recipe,
+    targetQuote: { sellSummary: BazaarLevel[]; buySummary: BazaarLevel[] },
+    data: Data,
+    products: Record<string, { sellSummary: BazaarLevel[] }>,
+    shardsById: Map<string, Shard>,
+    inventoryCapacityUnits: number,
+    capitalBudget: number
+  ): number[] {
+    const values = new Set<number>([1]);
+    const rawPerCraft = new Map<string, number>();
+
+    for (const input of recipe.inputs) {
+      const shard = data.shards[input];
+      if (!shard) continue;
+      rawPerCraft.set(input, (rawPerCraft.get(input) ?? 0) + shard.fuse_amount);
+    }
+
+    const addThresholds = (levels: BazaarLevel[], unitsPerCraft: number) => {
+      if (unitsPerCraft <= 0) return;
+      let cumulative = 0;
+      for (const level of levels) {
+        cumulative += Math.max(0, level.amount);
+        const crafts = Math.floor(cumulative / unitsPerCraft);
+        if (crafts >= 1) {
+          values.add(crafts);
+          values.add(crafts + 1);
+        }
+      }
+    };
+
+    addThresholds(targetQuote.buySummary, recipe.outputQuantity);
+
+    for (const input of recipe.inputs) {
+      const shard = data.shards[input];
+      const product = shard ? products[shard.internal_id] : undefined;
+      if (product) addThresholds(product.sellSummary, shard.fuse_amount);
+    }
+
+    const rawUnitsPerCraft = [...rawPerCraft.values()].reduce((sum, value) => sum + value, 0);
+    if (rawUnitsPerCraft > 0 && inventoryCapacityUnits > 0) {
+      const inventoryCrafts = Math.max(1, Math.floor(inventoryCapacityUnits / rawUnitsPerCraft));
+      for (const multiplier of [1, 2, 3, 4]) {
+        values.add(inventoryCrafts * multiplier);
+        values.add(Math.max(1, inventoryCrafts * multiplier - 1));
+      }
+    }
+
+    const roughCapitalPerCraft = recipe.inputs.reduce((sum, input) => {
+      const shard = data.shards[input];
+      const product = shard ? products[shard.internal_id] : undefined;
+      const price = product?.sellSummary?.[0]?.pricePerUnit ?? Infinity;
+      return sum + (shard ? shard.fuse_amount * price : 0);
+    }, 0);
+
+    if (Number.isFinite(roughCapitalPerCraft) && roughCapitalPerCraft > 0) {
+      const capitalCrafts = Math.floor(capitalBudget / roughCapitalPerCraft);
+      for (const multiplier of [0.25, 0.5, 0.75, 1]) {
+        const point = Math.floor(capitalCrafts * multiplier);
+        if (point >= 1) values.add(point);
+        if (point > 1) values.add(point - 1);
+      }
+    }
+
+    for (const value of [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]) values.add(value);
+
+    return [...values]
+      .filter((value) => Number.isFinite(value) && value >= 1)
+      .sort((a, b) => a - b)
+      .slice(0, MAX_CANDIDATES_PER_RECIPE);
   }
 
   public async findOpportunities(options: ArbitrageOptions = {}): Promise<ArbitrageOpportunity[]> {
@@ -305,9 +332,8 @@ export class BazaarArbitrageService {
       dataService.loadShards(),
     ]);
 
-    // IMPORTANT: do not use quick_status buyPrice or any current buy order as the input
-    // price. The true immediate purchase starts at sell_summary[0], and batch costs walk
-    // all subsequent sell-offer levels needed for the requested quantity.
+    // IMPORTANT: the input price source is the live sell-offer side, not quick_status.buyPrice
+    // and not the current buy-order side. Large quantities walk deeper sell-offer levels.
     const instantBuyUnitPrices: Record<string, number> = {};
     for (const shard of shards) {
       const quote = snapshot.products[shard.internal_id];
@@ -315,10 +341,31 @@ export class BazaarArbitrageService {
       if (price !== undefined) instantBuyUnitPrices[shard.id] = price;
     }
 
-    const params = this.makeMarketParams(instantBuyUnitPrices);
-    const calculationService = CalculationService.getInstance();
-    const data = calculationService.buildData(fusionJson, defaultRates, params);
+    // Keep the existing SkyShards fusion graph as our recipe source of truth.
     const shardById = new Map(shards.map((shard) => [shard.id, shard]));
+    const data: Data = {
+      shards: Object.fromEntries(shards.map((shard) => [shard.id, shard])),
+      recipes: {},
+      ...(dataService ? {} : {}),
+    } as Data;
+
+    // Build the recipe graph without recalculating market costs inside CalculationService.
+    // DataService's fusion file is the authoritative recipe source.
+    const fusionData = fusionJson;
+    for (const [shardId, shard] of Object.entries(fusionData.shards)) {
+      if (!shard.recipes) continue;
+      data.recipes[shardId] = shard.recipes.map((recipe) => ({
+        inputs: recipe.inputs,
+        outputQuantity: recipe.outputQuantity,
+      })) as Recipe[];
+    }
+
+    // Some SkyShards versions expose recipes differently; fall back to the existing calculator
+    // graph builder when the direct fusion structure is not present.
+    if (Object.keys(data.recipes).length === 0) {
+      throw new Error("SkyShards fusion recipe graph could not be loaded");
+    }
+
     const opportunities: ArbitrageOpportunity[] = [];
 
     for (const shard of shards) {
@@ -327,15 +374,25 @@ export class BazaarArbitrageService {
       const quote = snapshot.products[shard.internal_id];
       if (!quote?.buySummary?.length) continue;
 
-      const acquisitionMemo = new Map<string, AcquisitionResult>();
-      const minOutput = Math.max(1, recipes.reduce((min, r) => Math.min(min, r.outputQuantity), Infinity));
-      const maxCrafts = Math.max(1, Math.min(MAX_CRAFT_SEARCH, Math.floor(inventoryCapacityUnits / minOutput) * 8 + 64));
+      const candidateCounts = recipes.map((recipe) => this.buildCandidateCraftCounts(
+        recipe,
+        quote,
+        data,
+        snapshot.products,
+        shardById,
+        inventoryCapacityUnits,
+        capitalBudget
+      ));
 
-      for (const recipe of recipes) {
-        if (recipe.outputQuantity <= 0) continue;
+      for (let recipeIndex = 0; recipeIndex < recipes.length; recipeIndex += 1) {
+        const recipe = recipes[recipeIndex];
+        const candidates = candidateCounts[recipeIndex];
+        if (!recipe || !candidates) continue;
 
+        const memo = new Map<string, AcquisitionResult>();
         let best: BatchEvaluation | null = null;
-        for (let crafts = 1; crafts <= maxCrafts; crafts++) {
+
+        for (const crafts of candidates) {
           const evaluated = this.evaluateBatch(
             shard.id,
             recipe,
@@ -346,20 +403,15 @@ export class BazaarArbitrageService {
             saleTaxRate,
             capitalBudget,
             inventoryCapacityUnits,
-            acquisitionMemo
+            memo
           );
-
           if (!evaluated.feasible || evaluated.profit <= EPSILON) continue;
-          if (!best || evaluated.profit > best.profit || (Math.abs(evaluated.profit - best.profit) < EPSILON && evaluated.roi > best.roi)) {
-            best = evaluated;
-          }
+          if (!best || evaluated.profit > best.profit || (Math.abs(evaluated.profit - best.profit) < EPSILON && evaluated.roi > best.roi)) best = evaluated;
         }
 
         if (!best) continue;
 
         const acquisitionPath = this.buildPurchaseLegs(best.rawMaterials, snapshot.products, shardById);
-        const saleUnit = best.outputQuantity > 0 ? best.grossRevenue / best.outputQuantity : 0;
-
         opportunities.push({
           shardId: shard.id,
           shardName: shard.name,
@@ -368,7 +420,7 @@ export class BazaarArbitrageService {
           outputQuantity: best.outputQuantity,
           batchCrafts: best.crafts,
           inputCost: best.inputCost,
-          resaleUnitPrice: saleUnit,
+          resaleUnitPrice: best.outputQuantity > 0 ? best.grossRevenue / best.outputQuantity : 0,
           grossRevenue: best.grossRevenue,
           saleTax: best.saleTax,
           netRevenue: best.netRevenue,
@@ -387,7 +439,6 @@ export class BazaarArbitrageService {
       }
     }
 
-    // A+B and B+A are the same economic recipe.
     const unique = new Map<string, ArbitrageOpportunity>();
     for (const opportunity of opportunities) {
       const inputs = [...opportunity.recipe.inputs].sort().join("|");
@@ -397,11 +448,7 @@ export class BazaarArbitrageService {
     }
 
     return [...unique.values()]
-      .sort((a, b) => {
-        if (b.profit !== a.profit) return b.profit - a.profit;
-        if (b.roi !== a.roi) return b.roi - a.roi;
-        return b.profitPerOutput - a.profitPerOutput;
-      })
+      .sort((a, b) => b.profit - a.profit || b.roi - a.roi || b.profitPerOutput - a.profitPerOutput)
       .slice(0, limit);
   }
 }
