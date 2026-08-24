@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { RefreshCw, TrendingUp, ShoppingCart, ArrowDownUp, Boxes } from "lucide-react";
-import { BazaarArbitrageService } from "../services";
+import { BazaarArbitrageService, DataService } from "../services";
 import type { ArbitrageOpportunity } from "../types/bazaarArbitrage";
 
 const DEFAULT_CAPITAL = 100_000_000;
@@ -21,22 +21,43 @@ export const BazaarArbitragePage: React.FC = () => {
   const [lastUpdated, setLastUpdated] = useState<number | null>(null);
   const [capitalMillions, setCapitalMillions] = useState(DEFAULT_CAPITAL / 1_000_000);
   const [inventoryStacks, setInventoryStacks] = useState(DEFAULT_STACKS);
+  const [shardNames, setShardNames] = useState<Record<string, string>>({});
 
   const capitalBudget = useMemo(() => Math.max(0, capitalMillions) * 1_000_000, [capitalMillions]);
+
+  const displayOpportunities = useMemo(() => {
+    // The fusion dataset can contain the same recipe with inputs reversed.
+    // Collapse mirrored recipes so the user sees one actionable opportunity.
+    const unique = new Map<string, ArbitrageOpportunity>();
+    for (const opportunity of opportunities) {
+      const canonicalInputs = [...opportunity.recipe.inputs].sort().join("|");
+      const key = `${opportunity.shardId}|${opportunity.recipe.outputQuantity}|${canonicalInputs}`;
+      const existing = unique.get(key);
+      if (!existing || opportunity.profit > existing.profit) {
+        unique.set(key, opportunity);
+      }
+    }
+    return [...unique.values()].sort((a, b) => b.profit - a.profit);
+  }, [opportunities]);
 
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const results = await BazaarArbitrageService.getInstance().findOpportunities({
-        saleTaxRate: 0.01,
-        minOutputLiquidity: 1,
-        limit: 50,
-        capitalBudget,
-        maxInventoryStacks: inventoryStacks,
-        stackSize: STACK_SIZE,
-      });
+      const [results, shards] = await Promise.all([
+        BazaarArbitrageService.getInstance().findOpportunities({
+          saleTaxRate: 0.01,
+          minOutputLiquidity: 1,
+          limit: 100,
+          capitalBudget,
+          maxInventoryStacks: inventoryStacks,
+          stackSize: STACK_SIZE,
+        }),
+        DataService.getInstance().loadShards(),
+      ]);
+
       setOpportunities(results);
+      setShardNames(Object.fromEntries(shards.map((shard) => [shard.id, shard.name])));
       setLastUpdated(results[0]?.fetchedAt ?? Date.now());
     } catch (err) {
       console.error(err);
@@ -52,6 +73,24 @@ export const BazaarArbitragePage: React.FC = () => {
     return () => window.clearInterval(interval);
   }, [refresh]);
 
+  const formatPurchasePlan = useCallback((opportunity: ArbitrageOpportunity) => {
+    const aggregated = new Map<string, { quantity: number; totalCost: number }>();
+    for (const leg of opportunity.acquisitionPath) {
+      if (leg.method !== "bazaar") continue;
+      const current = aggregated.get(leg.shardId) ?? { quantity: 0, totalCost: 0 };
+      current.quantity += leg.quantity;
+      current.totalCost += leg.totalCost;
+      aggregated.set(leg.shardId, current);
+    }
+    return [...aggregated.entries()]
+      .map(([shardId, value]) => ({
+        shardId,
+        name: shardNames[shardId] ?? shardId,
+        ...value,
+      }))
+      .sort((a, b) => b.totalCost - a.totalCost);
+  }, [shardNames]);
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 p-4 sm:p-6">
       <div className="max-w-screen-2xl mx-auto space-y-5">
@@ -62,9 +101,9 @@ export const BazaarArbitragePage: React.FC = () => {
               Bazaar Arbitrage
             </div>
             <h1 className="text-2xl sm:text-3xl font-bold mt-1">Best executable shard batches right now</h1>
-            <p className="text-slate-400 mt-1 max-w-4xl">
-              The ranking now optimizes the <strong>total profit of an actual batch</strong>. Raw materials are
-              always bought immediately from the live sell side; completed shards are immediately sold into live buy orders.
+            <p className="text-slate-400 mt-1 max-w-5xl">
+              Each row is an executable batch under your capital and inventory limits. The <strong>Buy</strong> column is the
+              actual raw-shard shopping list: those quantities are purchased immediately from Bazaar sell offers.
             </p>
           </div>
           <button
@@ -134,6 +173,7 @@ export const BazaarArbitragePage: React.FC = () => {
               <tr className="text-left text-slate-400">
                 <th className="px-4 py-3">#</th>
                 <th className="px-4 py-3">Shard</th>
+                <th className="px-4 py-3">Buy</th>
                 <th className="px-4 py-3">Batch</th>
                 <th className="px-4 py-3">Recipe</th>
                 <th className="px-4 py-3 text-right">Capital</th>
@@ -144,28 +184,42 @@ export const BazaarArbitragePage: React.FC = () => {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800">
-              {opportunities.map((opportunity, index) => (
-                <tr key={`${opportunity.shardId}-${index}`} className="hover:bg-slate-800/40">
-                  <td className="px-4 py-3 text-slate-500 font-mono">{index + 1}</td>
-                  <td className="px-4 py-3">
-                    <div className="font-semibold">{opportunity.shardName}</div>
-                    <div className="text-xs text-slate-500">{opportunity.rarity}</div>
-                  </td>
-                  <td className="px-4 py-3 font-mono">
-                    <div>{opportunity.batchCrafts} crafts</div>
-                    <div className="text-xs text-slate-500">→ {opportunity.outputQuantity.toLocaleString()} shards</div>
-                  </td>
-                  <td className="px-4 py-3 text-slate-300">{opportunity.recipe.inputs.join(" + ")} → ×{opportunity.recipe.outputQuantity}</td>
-                  <td className="px-4 py-3 text-right font-mono">{formatCoins(opportunity.capitalRequired)}</td>
-                  <td className="px-4 py-3 text-right font-mono text-emerald-300">{formatCoins(opportunity.profit)}</td>
-                  <td className="px-4 py-3 text-right font-mono text-emerald-300">{formatPct(opportunity.roi)}</td>
-                  <td className="px-4 py-3 text-right font-mono">{opportunity.peakInventoryStacks.toFixed(1)} stacks</td>
-                  <td className="px-4 py-3 text-right font-mono">{formatCoins(opportunity.sellLiquidity)}+</td>
-                </tr>
-              ))}
-              {!loading && opportunities.length === 0 && !error && (
+              {displayOpportunities.map((opportunity, index) => {
+                const purchases = formatPurchasePlan(opportunity);
+                return (
+                  <tr key={`${opportunity.shardId}-${opportunity.recipe.outputQuantity}-${opportunity.recipe.inputs.join("-")}`} className="align-top hover:bg-slate-800/40">
+                    <td className="px-4 py-3 text-slate-500 font-mono">{index + 1}</td>
+                    <td className="px-4 py-3">
+                      <div className="font-semibold">{opportunity.shardName}</div>
+                      <div className="text-xs text-slate-500">{opportunity.rarity}</div>
+                    </td>
+                    <td className="px-4 py-3 min-w-[280px]">
+                      <div className="space-y-1">
+                        {purchases.map((purchase) => (
+                          <div key={purchase.shardId} className="flex justify-between gap-4 font-mono text-xs">
+                            <span className="text-slate-200" title={purchase.shardId}>{purchase.quantity.toLocaleString()} × {purchase.name}</span>
+                            <span className="text-slate-400 whitespace-nowrap">{formatCoins(purchase.totalCost)}</span>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="text-xs text-slate-500 mt-2">Total instant-buy cost: {formatCoins(opportunity.inputCost)}</div>
+                    </td>
+                    <td className="px-4 py-3 font-mono whitespace-nowrap">
+                      <div>{opportunity.batchCrafts} crafts</div>
+                      <div className="text-xs text-slate-500">→ {opportunity.outputQuantity.toLocaleString()} shards</div>
+                    </td>
+                    <td className="px-4 py-3 text-slate-300 whitespace-nowrap">{opportunity.recipe.inputs.join(" + ")} → ×{opportunity.recipe.outputQuantity}</td>
+                    <td className="px-4 py-3 text-right font-mono whitespace-nowrap">{formatCoins(opportunity.capitalRequired)}</td>
+                    <td className="px-4 py-3 text-right font-mono text-emerald-300 whitespace-nowrap">{formatCoins(opportunity.profit)}</td>
+                    <td className="px-4 py-3 text-right font-mono text-emerald-300 whitespace-nowrap">{formatPct(opportunity.roi)}</td>
+                    <td className="px-4 py-3 text-right font-mono whitespace-nowrap">{opportunity.peakInventoryStacks.toFixed(1)} stacks</td>
+                    <td className="px-4 py-3 text-right font-mono whitespace-nowrap">{formatCoins(opportunity.sellLiquidity)}+</td>
+                  </tr>
+                );
+              })}
+              {!loading && displayOpportunities.length === 0 && !error && (
                 <tr>
-                  <td colSpan={9} className="px-4 py-10 text-center text-slate-500">No profitable executable batch was found within the current constraints.</td>
+                  <td colSpan={10} className="px-4 py-10 text-center text-slate-500">No profitable executable batch was found within the current constraints.</td>
                 </tr>
               )}
             </tbody>
