@@ -108,7 +108,7 @@ export const BazaarArbitragePage: React.FC = () => {
               />
               <span className="text-slate-400">stacks</span>
             </div>
-            <div className="text-xs text-slate-500 mt-1">Assumes {STACK_SIZE} shards per stack = {inventoryStacks * STACK_SIZE.toLocaleString()} units.</div>
+            <div className="text-xs text-slate-500 mt-1">Assumes {STACK_SIZE} shards per stack = {(inventoryStacks * STACK_SIZE).toLocaleString()} units.</div>
           </label>
 
           <div className="rounded-lg border border-slate-800 bg-slate-900/70 p-4">
