@@ -6,6 +6,7 @@ import { usePageTitle, useShardIconPreload } from "./hooks";
 import { ToastProvider } from "./components";
 
 const CalculatorPage = lazy(() => import("./pages/CalculatorPage").then((module) => ({ default: module.CalculatorPage })));
+const BazaarArbitragePage = lazy(() => import("./pages/BazaarArbitragePage"));
 const SettingsPage = lazy(() => import("./pages/SettingsPage").then((module) => ({ default: module.SettingsPage })));
 const RecipePage = lazy(() => import("./pages/RecipePage"));
 const FusionGraphPage = lazy(() => import("./pages/FusionGraphPage").then((module) => ({ default: module.FusionGraphPage })));
@@ -30,8 +31,8 @@ const AppWithProviders = () => {
 };
 
 const ProtectedLayout = () => {
-  usePageTitle(); // Update page title based on route
-  useShardIconPreload(); // Warm the icon cache once the browser is idle
+  usePageTitle();
+  useShardIconPreload();
 
   return (
     <CalculatorStateProvider>
@@ -57,6 +58,14 @@ const router = createBrowserRouter(
           element: (
             <Suspense fallback={<LoadingSpinner />}>
               <CalculatorPage />
+            </Suspense>
+          ),
+        },
+        {
+          path: "arbitrage",
+          element: (
+            <Suspense fallback={<LoadingSpinner />}>
+              <BazaarArbitragePage />
             </Suspense>
           ),
         },
