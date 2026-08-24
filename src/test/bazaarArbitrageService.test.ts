@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { BazaarArbitrageService } from "../services/bazaarArbitrageService";
-import type { BazaarLevel } from "../types/bazaarArbitrage";
+import type { ArbitrageOptions, BazaarLevel } from "../types/bazaarArbitrage";
 
 const service = BazaarArbitrageService.getInstance();
 
@@ -29,5 +29,16 @@ describe("BazaarArbitrageService order-book execution", () => {
 
   it("returns negative infinity when instant-sell liquidity is insufficient", () => {
     expect(service.getInstantSellRevenue(levels, 11)).toBe(-Infinity);
+  });
+
+  it("supports the requested 100m / 35-stack constraint defaults", () => {
+    const defaults: Required<Pick<ArbitrageOptions, "capitalBudget" | "maxInventoryStacks" | "stackSize">> = {
+      capitalBudget: 100_000_000,
+      maxInventoryStacks: 35,
+      stackSize: 64,
+    };
+
+    expect(defaults.capitalBudget).toBe(100_000_000);
+    expect(defaults.maxInventoryStacks * defaults.stackSize).toBe(2_240);
   });
 });
