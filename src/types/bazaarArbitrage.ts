@@ -39,7 +39,10 @@ export interface ArbitrageOpportunity {
     inputs: [string, string];
     outputQuantity: number;
   };
+  /** Number of final shard units actually produced in the recommended batch. */
   outputQuantity: number;
+  /** Number of final crafts in the recommended batch. */
+  batchCrafts: number;
   inputCost: number;
   resaleUnitPrice: number;
   grossRevenue: number;
@@ -51,6 +54,12 @@ export interface ArbitrageOpportunity {
   capitalRequired: number;
   acquisitionPath: ArbitrageLeg[];
   sellLiquidity: number;
+  /** Peak simultaneous shard units held while executing the recommended batch. */
+  peakInventoryUnits: number;
+  /** Peak simultaneous shard stacks held, using the configured stack size. */
+  peakInventoryStacks: number;
+  capitalBudget: number;
+  inventoryCapacityUnits: number;
   fetchedAt: number;
 }
 
@@ -58,4 +67,10 @@ export interface ArbitrageOptions {
   saleTaxRate?: number;
   minOutputLiquidity?: number;
   limit?: number;
+  /** Maximum coins allowed for one executable batch. */
+  capitalBudget?: number;
+  /** Maximum simultaneously-held shard stacks. */
+  maxInventoryStacks?: number;
+  /** Stack size used for shard inventory accounting. */
+  stackSize?: number;
 }
