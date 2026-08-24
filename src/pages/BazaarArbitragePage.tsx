@@ -26,8 +26,6 @@ export const BazaarArbitragePage: React.FC = () => {
   const capitalBudget = useMemo(() => Math.max(0, capitalMillions) * 1_000_000, [capitalMillions]);
 
   const displayOpportunities = useMemo(() => {
-    // The fusion dataset can contain the same recipe with inputs reversed.
-    // Collapse mirrored recipes so the user sees one actionable opportunity.
     const unique = new Map<string, ArbitrageOpportunity>();
     for (const opportunity of opportunities) {
       const canonicalInputs = [...opportunity.recipe.inputs].sort().join("|");
@@ -74,19 +72,22 @@ export const BazaarArbitragePage: React.FC = () => {
   }, [refresh]);
 
   const formatPurchasePlan = useCallback((opportunity: ArbitrageOpportunity) => {
-    const aggregated = new Map<string, { quantity: number; totalCost: number }>();
-    for (const leg of opportunity.acquisitionPath) {
-      if (leg.method !== "bazaar") continue;
-      const current = aggregated.get(leg.shardId) ?? { quantity: 0, totalCost: 0 };
-      current.quantity += leg.quantity;
-      current.totalCost += leg.totalCost;
-      aggregated.set(leg.shardId, current);
-    }
-    return [...aggregated.entries()]
-      .map(([shardId, value]) => ({
-        shardId,
-        name: shardNames[shardId] ?? shardId,
-        ...value,
+    // The service stores the merged raw-material map first, followed by recursive
+    // acquisition-detail legs. Keep the first Bazaar occurrence of each shard so the
+    // displayed shopping list reflects the actual raw-material quantities exactly once.
+    const seen = new Set<string>();
+    return opportunity.acquisitionPath
+      .filter((leg) => leg.method === "bazaar")
+      .filter((leg) => {
+        if (seen.has(leg.shardId)) return false;
+        seen.add(leg.shardId);
+        return true;
+      })
+      .map((leg) => ({
+        shardId: leg.shardId,
+        name: shardNames[leg.shardId] ?? leg.shardId,
+        quantity: leg.quantity,
+        totalCost: leg.totalCost,
       }))
       .sort((a, b) => b.totalCost - a.totalCost);
   }, [shardNames]);
@@ -187,13 +188,13 @@ export const BazaarArbitragePage: React.FC = () => {
               {displayOpportunities.map((opportunity, index) => {
                 const purchases = formatPurchasePlan(opportunity);
                 return (
-                  <tr key={`${opportunity.shardId}-${opportunity.recipe.outputQuantity}-${opportunity.recipe.inputs.join("-")}`} className="align-top hover:bg-slate-800/40">
+                  <tr key={`${opportunity.shardId}-${opportunity.recipe.outputQuantity}-${[...opportunity.recipe.inputs].sort().join("-")}`} className="align-top hover:bg-slate-800/40">
                     <td className="px-4 py-3 text-slate-500 font-mono">{index + 1}</td>
                     <td className="px-4 py-3">
                       <div className="font-semibold">{opportunity.shardName}</div>
                       <div className="text-xs text-slate-500">{opportunity.rarity}</div>
                     </td>
-                    <td className="px-4 py-3 min-w-[280px]">
+                    <td className="px-4 py-3 min-w-[320px]">
                       <div className="space-y-1">
                         {purchases.map((purchase) => (
                           <div key={purchase.shardId} className="flex justify-between gap-4 font-mono text-xs">
