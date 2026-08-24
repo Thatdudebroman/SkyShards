@@ -41,11 +41,7 @@ export class BazaarArbitrageService {
     return BazaarArbitrageService.instance;
   }
 
-  /**
-   * Exact immediate-purchase cost for a quantity. Hypixel's sell_summary is the live
-   * sell-offer ladder; consuming it from cheapest to most expensive is the correct
-   * model for an instant buy. We never use buy_summary for input acquisition.
-   */
+  /** Immediate-buy cost from the live sell-offer ladder. */
   public getInstantBuyCost(levels: BazaarLevel[], quantity: number): number {
     if (quantity <= EPSILON) return 0;
     let remaining = quantity;
@@ -54,7 +50,6 @@ export class BazaarArbitrageService {
     for (const level of levels) {
       if (remaining <= EPSILON) break;
       if (level.amount <= 0 || level.pricePerUnit < 0) continue;
-
       const filled = Math.min(remaining, level.amount);
       total += filled * level.pricePerUnit;
       remaining -= filled;
@@ -63,10 +58,7 @@ export class BazaarArbitrageService {
     return remaining > EPSILON ? Infinity : total;
   }
 
-  /**
-   * Exact immediate-sale revenue for a quantity. buy_summary is the live buy-order
-   * ladder; consuming it from highest to lowest is the executable instant-sell model.
-   */
+  /** Immediate-sell revenue from the live buy-order ladder. */
   public getInstantSellRevenue(levels: BazaarLevel[], quantity: number): number {
     if (quantity <= EPSILON) return 0;
     let remaining = quantity;
@@ -75,7 +67,6 @@ export class BazaarArbitrageService {
     for (const level of levels) {
       if (remaining <= EPSILON) break;
       if (level.amount <= 0 || level.pricePerUnit < 0) continue;
-
       const filled = Math.min(remaining, level.amount);
       total += filled * level.pricePerUnit;
       remaining -= filled;
@@ -115,20 +106,13 @@ export class BazaarArbitrageService {
   }
 
   private mergeQuantities(target: QuantityMap, source: QuantityMap): void {
-    for (const [shardId, quantity] of source) {
-      this.addQuantity(target, shardId, quantity);
-    }
+    for (const [shardId, quantity] of source) this.addQuantity(target, shardId, quantity);
   }
 
   /**
-   * Depth-aware recursive acquisition optimizer.
-   *
-   * For a requested quantity, compare:
-   *   1) buying that exact quantity immediately from the sell-offer ladder; and
-   *   2) every legal fusion recipe, priced at the exact child quantities needed.
-   *
-   * This deliberately does not use quick_status, the lowest buy order, or a single
-   * top-of-book quote extrapolated to the whole batch.
+   * Compare direct immediate purchase vs every legal recursive fusion path at the
+   * exact requested quantity. This is depth-aware: every direct purchase walks the
+   * sell-offer ladder and therefore scales with actual order-book liquidity.
    */
   private getBestAcquisition(
     shardId: string,
@@ -141,32 +125,26 @@ export class BazaarArbitrageService {
   ): AcquisitionResult {
     if (quantity <= EPSILON) return { cost: 0, rawMaterials: new Map() };
 
-    const roundedQuantity = Math.ceil(quantity - EPSILON);
-    const memoKey = `${shardId}:${roundedQuantity}`;
+    const requested = Math.ceil(quantity - EPSILON);
+    const memoKey = `${shardId}:${requested}`;
     const cached = memo.get(memoKey);
-    if (cached) {
-      return { cost: cached.cost, rawMaterials: new Map(cached.rawMaterials) };
-    }
+    if (cached) return { cost: cached.cost, rawMaterials: new Map(cached.rawMaterials) };
 
-    if (visiting.has(shardId)) {
-      return { cost: Infinity, rawMaterials: new Map() };
-    }
+    if (visiting.has(shardId)) return { cost: Infinity, rawMaterials: new Map() };
 
     const shard = shardsById.get(shardId);
     const product = shard ? snapshotProducts[shard.internal_id] : undefined;
-    let bestCost = product ? this.getInstantBuyCost(product.sellSummary, roundedQuantity) : Infinity;
-    let bestMaterials: QuantityMap = product && Number.isFinite(bestCost)
-      ? new Map([[shardId, roundedQuantity]])
+    let bestCost = product ? this.getInstantBuyCost(product.sellSummary, requested) : Infinity;
+    let bestMaterials: QuantityMap = Number.isFinite(bestCost)
+      ? new Map([[shardId, requested]])
       : new Map();
 
-    const recipes = data.recipes[shardId] ?? [];
     const nextVisiting = new Set(visiting);
     nextVisiting.add(shardId);
 
-    for (const recipe of recipes) {
+    for (const recipe of data.recipes[shardId] ?? []) {
       if (recipe.outputQuantity <= 0) continue;
-
-      const crafts = Math.ceil(roundedQuantity / recipe.outputQuantity - EPSILON);
+      const crafts = Math.ceil(requested / recipe.outputQuantity - EPSILON);
       const [inputA, inputB] = recipe.inputs;
       const shardA = data.shards[inputA];
       const shardB = data.shards[inputB];
@@ -218,13 +196,16 @@ export class BazaarArbitrageService {
       .map(([shardId, quantity]) => {
         const shard = shardsById.get(shardId);
         const product = shard ? snapshotProducts[shard.internal_id] : undefined;
-        const totalCost = product ? this.getInstantBuyCost(product.sellSummary, quantity) : Infinity;
+        const levels = product?.sellSummary ?? [];
+        const totalCost = this.getInstantBuyCost(levels, quantity);
         const unitCost = quantity > EPSILON ? totalCost / quantity : Infinity;
+        const instantBuyUnitPrice = levels[0]?.pricePerUnit ?? Infinity;
         return {
           shardId,
           quantity,
           unitCost,
           totalCost,
+          instantBuyUnitPrice,
           method: "bazaar" as const,
         };
       })
@@ -232,10 +213,6 @@ export class BazaarArbitrageService {
       .sort((a, b) => b.totalCost - a.totalCost);
   }
 
-  /**
-   * Estimate the peak number of shards simultaneously needed for a batch. This is a
-   * conservative raw-material view; the UI can still split a batch into buy/craft waves.
-   */
   private estimatePeakRawInventory(rawMaterials: QuantityMap): number {
     let total = 0;
     for (const quantity of rawMaterials.values()) total += quantity;
@@ -243,6 +220,7 @@ export class BazaarArbitrageService {
   }
 
   private evaluateBatch(
+    targetShardId: string,
     recipe: Recipe,
     crafts: number,
     data: Data,
@@ -254,59 +232,19 @@ export class BazaarArbitrageService {
     acquisitionMemo: Map<string, AcquisitionResult>
   ): BatchEvaluation {
     const outputQuantity = recipe.outputQuantity * crafts;
-    const rawMaterials = new Map<string, number>();
-
+    const rawMaterials: QuantityMap = new Map();
     const inputA = data.shards[recipe.inputs[0]];
     const inputB = data.shards[recipe.inputs[1]];
+
     if (!inputA || !inputB) {
-      return {
-        crafts,
-        outputQuantity,
-        rawMaterials,
-        inputCost: Infinity,
-        grossRevenue: 0,
-        saleTax: 0,
-        netRevenue: -Infinity,
-        profit: -Infinity,
-        roi: -Infinity,
-        peakInventoryUnits: Infinity,
-        feasible: false,
-      };
+      return { crafts, outputQuantity, rawMaterials, inputCost: Infinity, grossRevenue: 0, saleTax: 0, netRevenue: -Infinity, profit: -Infinity, roi: -Infinity, peakInventoryUnits: Infinity, feasible: false };
     }
 
-    const acquisitionA = this.getBestAcquisition(
-      recipe.inputs[0],
-      inputA.fuse_amount * crafts,
-      data,
-      snapshotProducts,
-      shardsById,
-      acquisitionMemo,
-      new Set()
-    );
-    const acquisitionB = this.getBestAcquisition(
-      recipe.inputs[1],
-      inputB.fuse_amount * crafts,
-      data,
-      snapshotProducts,
-      shardsById,
-      acquisitionMemo,
-      new Set()
-    );
+    const acquisitionA = this.getBestAcquisition(recipe.inputs[0], inputA.fuse_amount * crafts, data, snapshotProducts, shardsById, acquisitionMemo, new Set());
+    const acquisitionB = this.getBestAcquisition(recipe.inputs[1], inputB.fuse_amount * crafts, data, snapshotProducts, shardsById, acquisitionMemo, new Set());
 
     if (!Number.isFinite(acquisitionA.cost) || !Number.isFinite(acquisitionB.cost)) {
-      return {
-        crafts,
-        outputQuantity,
-        rawMaterials,
-        inputCost: Infinity,
-        grossRevenue: 0,
-        saleTax: 0,
-        netRevenue: -Infinity,
-        profit: -Infinity,
-        roi: -Infinity,
-        peakInventoryUnits: Infinity,
-        feasible: false,
-      };
+      return { crafts, outputQuantity, rawMaterials, inputCost: Infinity, grossRevenue: 0, saleTax: 0, netRevenue: -Infinity, profit: -Infinity, roi: -Infinity, peakInventoryUnits: Infinity, feasible: false };
     }
 
     this.mergeQuantities(rawMaterials, acquisitionA.rawMaterials);
@@ -314,69 +252,28 @@ export class BazaarArbitrageService {
 
     const inputCost = acquisitionA.cost + acquisitionB.cost;
     if (!Number.isFinite(inputCost) || inputCost > capitalBudget + EPSILON) {
-      return {
-        crafts,
-        outputQuantity,
-        rawMaterials,
-        inputCost,
-        grossRevenue: 0,
-        saleTax: 0,
-        netRevenue: -inputCost,
-        profit: -Infinity,
-        roi: -Infinity,
-        peakInventoryUnits: this.estimatePeakRawInventory(rawMaterials),
-        feasible: false,
-      };
+      return { crafts, outputQuantity, rawMaterials, inputCost, grossRevenue: 0, saleTax: 0, netRevenue: -inputCost, profit: -Infinity, roi: -Infinity, peakInventoryUnits: this.estimatePeakRawInventory(rawMaterials), feasible: false };
     }
 
-    const outputShard = shardsById.get(data.shards[recipe.inputs[0]] ? recipe.inputs[0] : "");
-    void outputShard;
-
-    const targetShardId = Object.entries(data.recipes).find(([, recipes]) => recipes.includes(recipe))?.[0];
-    const targetShard = targetShardId ? shardsById.get(targetShardId) : undefined;
-    const outputProduct = targetShard ? snapshotProducts[targetShard.internal_id] : undefined;
+    const outputProduct = snapshotProducts[shardsById.get(targetShardId)?.internal_id ?? ""];
     if (!outputProduct) {
-      return {
-        crafts,
-        outputQuantity,
-        rawMaterials,
-        inputCost,
-        grossRevenue: 0,
-        saleTax: 0,
-        netRevenue: -inputCost,
-        profit: -Infinity,
-        roi: -Infinity,
-        peakInventoryUnits: this.estimatePeakRawInventory(rawMaterials),
-        feasible: false,
-      };
+      return { crafts, outputQuantity, rawMaterials, inputCost, grossRevenue: 0, saleTax: 0, netRevenue: -inputCost, profit: -Infinity, roi: -Infinity, peakInventoryUnits: this.estimatePeakRawInventory(rawMaterials), feasible: false };
     }
 
     const grossRevenue = this.getInstantSellRevenue(outputProduct.buySummary, outputQuantity);
     if (!Number.isFinite(grossRevenue)) {
-      return {
-        crafts,
-        outputQuantity,
-        rawMaterials,
-        inputCost,
-        grossRevenue: 0,
-        saleTax: 0,
-        netRevenue: -inputCost,
-        profit: -Infinity,
-        roi: -Infinity,
-        peakInventoryUnits: this.estimatePeakRawInventory(rawMaterials),
-        feasible: false,
-      };
+      return { crafts, outputQuantity, rawMaterials, inputCost, grossRevenue: 0, saleTax: 0, netRevenue: -inputCost, profit: -Infinity, roi: -Infinity, peakInventoryUnits: this.estimatePeakRawInventory(rawMaterials), feasible: false };
     }
 
-    const peakInventoryUnits = this.estimatePeakRawInventory(rawMaterials);
-    // A batch may be larger than the physical inventory because it can be executed in
-    // waves. The UI exposes those waves. Keep the capacity as a warning rather than
-    // discarding otherwise profitable market-depth opportunities.
     const saleTax = grossRevenue * saleTaxRate;
     const netRevenue = grossRevenue - saleTax;
     const profit = netRevenue - inputCost;
     const roi = inputCost > EPSILON ? profit / inputCost : Infinity;
+    const peakInventoryUnits = this.estimatePeakRawInventory(rawMaterials);
 
+    // The full batch can be executed in waves when raw materials exceed one inventory.
+    // Inventory capacity therefore informs the displayed wave plan rather than falsely
+    // forcing the total shopping list below 35 stacks.
     return {
       crafts,
       outputQuantity,
@@ -388,7 +285,7 @@ export class BazaarArbitrageService {
       profit,
       roi,
       peakInventoryUnits,
-      feasible: peakInventoryUnits > 0 || inventoryCapacityUnits > 0,
+      feasible: inventoryCapacityUnits > 0,
     };
   }
 
@@ -408,9 +305,9 @@ export class BazaarArbitrageService {
       dataService.loadShards(),
     ]);
 
-    // quick_status is intentionally not used. It is a weighted summary, not an
-    // executable price for an arbitrary quantity. The input price source is the
-    // lowest current sell-offer level in sell_summary.
+    // IMPORTANT: do not use quick_status buyPrice or any current buy order as the input
+    // price. The true immediate purchase starts at sell_summary[0], and batch costs walk
+    // all subsequent sell-offer levels needed for the requested quantity.
     const instantBuyUnitPrices: Record<string, number> = {};
     for (const shard of shards) {
       const quote = snapshot.products[shard.internal_id];
@@ -427,26 +324,20 @@ export class BazaarArbitrageService {
     for (const shard of shards) {
       const recipes = data.recipes[shard.id] ?? [];
       if (recipes.length === 0) continue;
-
       const quote = snapshot.products[shard.internal_id];
       if (!quote?.buySummary?.length) continue;
 
       const acquisitionMemo = new Map<string, AcquisitionResult>();
-      let maxCrafts = Math.floor(MAX_CRAFT_SEARCH / Math.max(1, recipes.reduce((min, recipe) => Math.min(min, recipe.outputQuantity), Infinity)));
-      maxCrafts = Math.max(1, maxCrafts);
+      const minOutput = Math.max(1, recipes.reduce((min, r) => Math.min(min, r.outputQuantity), Infinity));
+      const maxCrafts = Math.max(1, Math.min(MAX_CRAFT_SEARCH, Math.floor(inventoryCapacityUnits / minOutput) * 8 + 64));
 
       for (const recipe of recipes) {
         if (recipe.outputQuantity <= 0) continue;
 
-        let maxFeasibleCrafts = Math.min(maxCrafts, Math.floor(inventoryCapacityUnits / Math.max(1, recipe.outputQuantity)) * 4 + 1);
-        maxFeasibleCrafts = Math.max(1, maxFeasibleCrafts);
-
         let best: BatchEvaluation | null = null;
-        // Scan every craft count in the practical range. This is intentional: order-book
-        // depth creates discontinuities whenever a sell-offer level is exhausted, so a
-        // coarse ROI sample can miss the best executable batch.
-        for (let crafts = 1; crafts <= maxFeasibleCrafts; crafts++) {
+        for (let crafts = 1; crafts <= maxCrafts; crafts++) {
           const evaluated = this.evaluateBatch(
+            shard.id,
             recipe,
             crafts,
             data,
@@ -496,7 +387,7 @@ export class BazaarArbitrageService {
       }
     }
 
-    // Remove mirrored recipe entries (A+B and B+A are economically identical).
+    // A+B and B+A are the same economic recipe.
     const unique = new Map<string, ArbitrageOpportunity>();
     for (const opportunity of opportunities) {
       const inputs = [...opportunity.recipe.inputs].sort().join("|");
