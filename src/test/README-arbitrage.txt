@@ -1,0 +1,1 @@
+Arbitrage tests use live-order-book semantics: sell_summary for immediate buys and buy_summary for immediate sells.
